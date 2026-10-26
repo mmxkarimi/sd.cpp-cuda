@@ -1,0 +1,323 @@
+name: Build stable-diffusion.cpp with CUDA
+
+on:
+  schedule:
+    # Run daily at 00:00 UTC
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: 'Force build even if no new release'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  check-release:
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.check.outputs.should_build }}
+      release_tag: ${{ steps.check.outputs.release_tag }}
+      release_hash: ${{ steps.check.outputs.release_hash }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check for new stable-diffusion.cpp release
+        id: check
+        run: |
+          # Get latest release from stable-diffusion.cpp
+          RELEASE_JSON=$(curl -s --retry 3 https://api.github.com/repos/leejet/stable-diffusion.cpp/releases/latest)
+          LATEST_RELEASE=$(echo "$RELEASE_JSON" | jq -r '.tag_name')
+          RELEASE_HASH=$(echo "$RELEASE_JSON" | jq -r '.target_commitish')
+
+          if [ -z "$LATEST_RELEASE" ] || [ "$LATEST_RELEASE" = "null" ]; then
+            echo "No release found upstream, skipping build"
+            echo "should_build=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "Latest stable-diffusion.cpp release: $LATEST_RELEASE"
+          echo "Release hash: $RELEASE_HASH"
+
+          # Check if we've already built this release
+          if git tag | grep -q "^${LATEST_RELEASE}$"; then
+            echo "Release $LATEST_RELEASE already built"
+            if [ "${{ github.event.inputs.force_build }}" = "true" ]; then
+              echo "Force build enabled, building anyway"
+              echo "should_build=true" >> $GITHUB_OUTPUT
+            else
+              echo "should_build=false" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "New release detected: $LATEST_RELEASE"
+            echo "should_build=true" >> $GITHUB_OUTPUT
+          fi
+
+          echo "release_tag=$LATEST_RELEASE" >> $GITHUB_OUTPUT
+          echo "release_hash=$RELEASE_HASH" >> $GITHUB_OUTPUT
+
+  build:
+    needs: check-release
+    if: needs.check-release.outputs.should_build == 'true'
+    runs-on: ${{ matrix.arch.runs_on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        cuda_version: ['12.8.1']
+        arch:
+          # Native runners — no QEMU. nvidia/cuda:*-cudnn-devel-ubuntu22.04 is
+          # multi-arch on Docker Hub so the same build path runs on both.
+          - { suffix: amd64, runs_on: ubuntu-latest }
+          - { suffix: arm64, runs_on: ubuntu-24.04-arm }
+        include:
+          - cuda_version: '12.8.1'
+            cuda_version_short: '12.8'
+            cuda_tag: '12.8.1-cudnn-devel-ubuntu22.04'
+            # CUDA compute capabilities target the runtime GPU, not the host
+            # CPU arch, so the same list applies to both amd64 and arm64
+            # builds. Relevant aarch64 GPU contexts (Grace Hopper, Grace
+            # Blackwell, DGX Spark) are covered by sm_90 / sm_100 / sm_120.
+            architectures: '75-virtual;80-virtual;86-virtual;89-virtual;90-virtual;100-virtual;120-virtual'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Maximize build space
+        run: |
+          echo "=== Initial Disk Space ==="
+          df -h
+
+          echo "=== Removing unnecessary packages ==="
+          sudo apt-get remove -y '^aspnetcore-.*' || true
+          sudo apt-get remove -y '^dotnet-.*' --fix-missing || true
+          sudo apt-get remove -y '^llvm-.*' --fix-missing || true
+          sudo apt-get remove -y 'php.*' --fix-missing || true
+          sudo apt-get remove -y '^mongodb-.*' --fix-missing || true
+          sudo apt-get remove -y '^mysql-.*' --fix-missing || true
+          sudo apt-get remove -y azure-cli google-chrome-stable firefox powershell mono-devel libgl1-mesa-dri --fix-missing || true
+          sudo apt-get autoremove -y || true
+          sudo apt-get clean || true
+
+          echo "=== Removing large directories ==="
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf /usr/share/swift
+          sudo rm -rf /usr/local/.ghcup
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+
+          # Clean docker system
+          docker system prune -af || true
+
+          echo "=== After Cleanup ==="
+          df -h
+
+      - name: Build stable-diffusion.cpp with CUDA
+        run: |
+          # Pull Docker image
+          docker pull nvidia/cuda:${{ matrix.cuda_tag }}
+
+          # Run build in container
+          docker run --rm \
+            -v $PWD:/workspace \
+            nvidia/cuda:${{ matrix.cuda_tag }} \
+            bash -c "
+              set -e
+
+              echo '=== Installing minimal dependencies ==='
+              apt-get update -qq
+              apt-get install -y --no-install-recommends git cmake ninja-build build-essential libssl-dev ca-certificates curl gnupg
+              # sd-server embeds the web UI at build time, so the build needs Node + pnpm
+              # (same approach as upstream docker/Dockerfile.cuda)
+              mkdir -p /etc/apt/keyrings
+              curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key -o /tmp/nodesource-repo.gpg.key
+              gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg /tmp/nodesource-repo.gpg.key
+              echo 'deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_22.x nodistro main' > /etc/apt/sources.list.d/nodesource.list
+              apt-get update -qq
+              apt-get install -y --no-install-recommends nodejs
+              npm install -g pnpm@10.15.1
+              apt-get clean
+              rm -rf /var/lib/apt/lists/*
+
+              echo '=== Cloning stable-diffusion.cpp (with submodules) ==='
+              cd /workspace
+              if git clone --recursive --depth 1 --branch ${{ needs.check-release.outputs.release_tag }} https://github.com/leejet/stable-diffusion.cpp.git; then
+                cd stable-diffusion.cpp
+              else
+                git clone --recursive https://github.com/leejet/stable-diffusion.cpp.git
+                cd stable-diffusion.cpp
+                git checkout ${{ needs.check-release.outputs.release_hash }}
+                git submodule update --init --recursive
+              fi
+
+              echo '=== Configuring build with Ninja ==='
+              export LIBRARY_PATH=\"/usr/local/cuda/lib64/stubs\${LIBRARY_PATH:+:\$LIBRARY_PATH}\"
+
+              ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1
+              cmake -B build -S . \
+                -G Ninja \
+                -DSD_CUDA=ON \
+                -DSD_BUILD_SHARED_LIBS=ON \
+                -DGGML_NATIVE=OFF \
+                -DSD_BUILD_SHARED_GGML_LIB=ON \
+                -DGGML_BACKEND_DL=ON \
+                -DGGML_CPU_ALL_VARIANTS=ON \
+                -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+                -DCMAKE_INSTALL_RPATH='\$ORIGIN' \
+                -DCMAKE_CUDA_ARCHITECTURES='${{ matrix.architectures }}' \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_EXE_LINKER_FLAGS='-Wl,-rpath-link,/usr/local/cuda/lib64/stubs' \
+                -DCMAKE_SHARED_LINKER_FLAGS='-Wl,-rpath-link,/usr/local/cuda/lib64/stubs'
+
+              echo '=== Building with Ninja (parallel: all cores) ==='
+              cmake --build build --config Release -j\$(nproc)
+
+              echo '=== Copying binaries ==='
+              cd /workspace
+              mkdir -p binaries/cuda-${{ matrix.cuda_version_short }}
+
+              # Copy everything from build/bin (sd-cli, sd-server, shared libs
+              # and the ggml CPU-variant / CUDA backend modules)
+              cp -r stable-diffusion.cpp/build/bin/* binaries/cuda-${{ matrix.cuda_version_short }}/
+
+              # Strip binaries to reduce size (executables only, not .so files)
+              find binaries/cuda-${{ matrix.cuda_version_short }}/ -type f -executable ! -name \"*.so*\" -exec strip {} \; 2>/dev/null || true
+
+              echo '=== Creating version info ==='
+              echo 'stable-diffusion.cpp version: ${{ needs.check-release.outputs.release_tag }}' > binaries/cuda-${{ matrix.cuda_version_short }}/VERSION.txt
+              echo 'CUDA version: ${{ matrix.cuda_version }}' >> binaries/cuda-${{ matrix.cuda_version_short }}/VERSION.txt
+              echo 'Architectures: ${{ matrix.architectures }}' >> binaries/cuda-${{ matrix.cuda_version_short }}/VERSION.txt
+              echo 'Build date: '\$(date -u +%Y-%m-%d) >> binaries/cuda-${{ matrix.cuda_version_short }}/VERSION.txt
+              echo 'Build hash: ${{ needs.check-release.outputs.release_hash }}' >> binaries/cuda-${{ matrix.cuda_version_short }}/VERSION.txt
+
+              echo '=== Build complete ==='
+              ls -lh binaries/cuda-${{ matrix.cuda_version_short }}/
+
+              echo '=== Cleaning up build directory ==='
+              rm -rf stable-diffusion.cpp
+            "
+
+          # Remove Docker image to free space
+          docker rmi nvidia/cuda:${{ matrix.cuda_tag }} || true
+
+          # Fix permissions for files created by root in container
+          sudo chown -R $(id -u):$(id -g) $PWD
+
+          echo "=== Final disk usage ==="
+          df -h
+
+      - name: Create tarball
+        run: |
+          cd binaries
+          tar -czf sd.cpp-${{ needs.check-release.outputs.release_tag }}-cuda-${{ matrix.cuda_version_short }}-${{ matrix.arch.suffix }}.tar.gz cuda-${{ matrix.cuda_version_short }}
+          ls -lh *.tar.gz
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          # Arch suffix in the artifact name so the matrix jobs do not collide
+          # in actions/download-artifact later.
+          name: sd.cpp-cuda-${{ matrix.cuda_version_short }}-${{ matrix.arch.suffix }}
+          path: binaries/*.tar.gz
+          retention-days: 1
+
+  release:
+    needs: [check-release, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Full history + tags so the tag push below is a fast-forward and
+          # duplicate tags are visible.
+          fetch-depth: 0
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release assets
+        run: |
+          mkdir -p release-assets
+          find artifacts -name "*.tar.gz" -exec cp {} release-assets/ \;
+          ls -lh release-assets/
+
+      - name: Create advancing release tag
+        # GitHub sorts the /releases list by each release's created_at, which is
+        # the *committer date of the tag's target commit* — not the publish
+        # time. Anchor each tag to a fresh empty commit whose committer date is
+        # build time so created_at advances and new releases sort to the top of
+        # the list. The commit is reachable only via its tag; main is never pushed.
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.check-release.outputs.release_tag }}"
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit --allow-empty \
+            -m "stable-diffusion.cpp ${TAG} (CUDA build $(date -u +%Y-%m-%dT%H:%M:%SZ))"
+          git tag "${TAG}"
+          git push origin "refs/tags/${TAG}"
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ needs.check-release.outputs.release_tag }}
+          name: stable-diffusion.cpp ${{ needs.check-release.outputs.release_tag }} with CUDA
+          body: |
+            # stable-diffusion.cpp ${{ needs.check-release.outputs.release_tag }} with CUDA Support
+
+            Pre-built binaries of [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp) with CUDA support.
+
+            **Source:** https://github.com/leejet/stable-diffusion.cpp/releases/tag/${{ needs.check-release.outputs.release_tag }}
+            **Commit:** ${{ needs.check-release.outputs.release_hash }}
+
+            ## What is included
+            - `sd-cli` — CLI for image / video generation
+            - `sd-server` — web UI server (frontend embedded at build time)
+            - Shared libraries in the same folder: `libstable-diffusion.so`, CPU-variant and CUDA backend modules (loaded via `$ORIGIN` rpath, so keep everything together)
+
+            Includes WebP image I/O and WebM video output. Native SageAttention (`--sage-attn`) is available for GPUs with compute capability ≥ 8.0.
+
+            ## CUDA Versions
+            - CUDA 12.8 - GPU compute capabilities: 7.5, 8.0, 8.6, 8.9, 9.0, 10.0, 12.0
+            - Kernels ship as PTX and are JIT-compiled by the driver at first run — use an up-to-date driver (R570+ / CUDA 12.8 compatible).
+
+            ## Host architectures
+            Tarballs are published per host CPU architecture (Linux):
+            - `-amd64.tar.gz` — x86_64 (most desktops, servers, cloud VMs)
+            - `-arm64.tar.gz` — aarch64 (Grace Hopper / Grace Blackwell / DGX Spark / Ampere Altra)
+
+            ## GPU compute capability reference
+            - 7.5: Tesla T4, RTX 20xx series, Quadro RTX
+            - 8.0: A100
+            - 8.6: RTX 3000 series
+            - 8.9: RTX 4000 series, L4, L40
+            - 9.0: H100, H200, GH200
+            - 10.0: B200, GB200
+            - 12.0: RTX Pro series, RTX 50xx
+
+            ## Usage
+            Download the tarball matching your host CPU arch, then extract:
+            ```bash
+            # amd64 host
+            tar -xzf sd.cpp-${{ needs.check-release.outputs.release_tag }}-cuda-12.8-amd64.tar.gz
+            # arm64 host (e.g. Grace Blackwell)
+            tar -xzf sd.cpp-${{ needs.check-release.outputs.release_tag }}-cuda-12.8-arm64.tar.gz
+            cd cuda-12.8
+            # Text-to-image with a safetensors checkpoint
+            ./sd-cli -m sd_xl_base_1.0.safetensors -p "a photo of a cat" --steps 30
+            # Or run the web UI server
+            ./sd-server --models-path .
+            ```
+          files: release-assets/*
+          draft: false
+          prerelease: false
