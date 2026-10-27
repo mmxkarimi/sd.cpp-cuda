@@ -1,4 +1,6 @@
-# sd.cpp.cuda
+# sd.cpp-cuda
+
+[![Build stable-diffusion.cpp with CUDA](https://github.com/mmxkarimi/sd.cpp-cuda/actions/workflows/build-cuda.yml/badge.svg)](https://github.com/mmxkarimi/sd.cpp-cuda/actions/workflows/build-cuda.yml)
 
 Pre-built [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp) (sd.cpp) binaries with **CUDA** support for multiple GPU architectures, for **Linux**.
 
@@ -6,16 +8,11 @@ A scheduled GitHub Actions workflow ([.github/workflows/build-cuda.yml](.github/
 
 ## Download
 
-Grab the latest tarball matching your **host CPU** architecture:
+Grab the latest tarball:
 
 ```bash
-# amd64 (x86_64)
 curl -LO $(curl -s https://api.github.com/repos/mmxkarimi/sd.cpp.cuda/releases/latest \
   | jq -r '.assets[] | select(.name | contains("amd64.tar.gz")) | .browser_download_url')
-
-# arm64 (aarch64 — Grace Hopper / Grace Blackwell / DGX Spark / Ampere Altra)
-curl -LO $(curl -s https://api.github.com/repos/mmxkarimi/sd.cpp.cuda/releases/latest \
-  | jq -r '.assets[] | select(.name | contains("arm64.tar.gz")) | .browser_download_url')
 
 tar -xzf sd.cpp-*-cuda-12.8-*.tar.gz && cd cuda-12.8
 ```
@@ -36,13 +33,13 @@ Includes WebP image I/O, WebM video output, and native SageAttention (`--sage-at
 - **CUDA:** 12.8.1 (container `nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04`)
 - **Compute capabilities:** `75, 80, 86, 89, 90, 100, 120` (PTX only — JIT-compiled by the driver on first run, so a recent driver, R570+, is required)
 - **Backends:** `SD_CUDA=ON`, shared libs with `GGML_BACKEND_DL` + `GGML_CPU_ALL_VARIANTS` (portable across CPU generations), patched GGML submodule
-- **Host arches:** amd64 (x86_64) and arm64 (aarch64, native runner)
+- **Host arch:** amd64 (x86_64)
 
 ### GPU compute capability reference
 
 | CC | GPUs |
 | --- | --- |
-| 7.5 | Tesla T4, RTX 20xx, Quadro RTX |
+| 7.5 | Tesla T4, RTX 20xx, GTX 16xx, Quadro RTX |
 | 8.0 | A100 |
 | 8.6 | RTX 3000 series |
 | 8.9 | RTX 4000, L4, L40 |
