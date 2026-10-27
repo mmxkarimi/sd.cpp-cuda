@@ -68,18 +68,12 @@ jobs:
       matrix:
         cuda_version: ['12.8.1']
         arch:
-          # Native runners — no QEMU. nvidia/cuda:*-cudnn-devel-ubuntu22.04 is
-          # multi-arch on Docker Hub so the same build path runs on both.
           - { suffix: amd64, runs_on: ubuntu-latest }
-          - { suffix: arm64, runs_on: ubuntu-24.04-arm }
         include:
           - cuda_version: '12.8.1'
             cuda_version_short: '12.8'
             cuda_tag: '12.8.1-cudnn-devel-ubuntu22.04'
-            # CUDA compute capabilities target the runtime GPU, not the host
-            # CPU arch, so the same list applies to both amd64 and arm64
-            # builds. Relevant aarch64 GPU contexts (Grace Hopper, Grace
-            # Blackwell, DGX Spark) are covered by sm_90 / sm_100 / sm_120.
+            # CUDA compute capabilities target the runtime GPU, not the host CPU arch.
             architectures: '75-virtual;80-virtual;86-virtual;89-virtual;90-virtual;100-virtual;120-virtual'
 
     steps:
@@ -291,10 +285,8 @@ jobs:
             - CUDA 12.8 - GPU compute capabilities: 7.5, 8.0, 8.6, 8.9, 9.0, 10.0, 12.0
             - Kernels ship as PTX and are JIT-compiled by the driver at first run — use an up-to-date driver (R570+ / CUDA 12.8 compatible).
 
-            ## Host architectures
-            Tarballs are published per host CPU architecture (Linux):
-            - `-amd64.tar.gz` — x86_64 (most desktops, servers, cloud VMs)
-            - `-arm64.tar.gz` — aarch64 (Grace Hopper / Grace Blackwell / DGX Spark / Ampere Altra)
+            ## Host architecture
+            Tarballs are published for Linux x86_64 only (`-amd64.tar.gz`).
 
             ## GPU compute capability reference
             - 7.5: Tesla T4, RTX 20xx series, Quadro RTX
@@ -306,12 +298,9 @@ jobs:
             - 12.0: RTX Pro series, RTX 50xx
 
             ## Usage
-            Download the tarball matching your host CPU arch, then extract:
+            Download the tarball, then extract:
             ```bash
-            # amd64 host
             tar -xzf sd.cpp-${{ needs.check-release.outputs.release_tag }}-cuda-12.8-amd64.tar.gz
-            # arm64 host (e.g. Grace Blackwell)
-            tar -xzf sd.cpp-${{ needs.check-release.outputs.release_tag }}-cuda-12.8-arm64.tar.gz
             cd cuda-12.8
             # Text-to-image with a safetensors checkpoint
             ./sd-cli -m sd_xl_base_1.0.safetensors -p "a photo of a cat" --steps 30
